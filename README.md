@@ -160,10 +160,6 @@ This server requires macOS because Fantastical is a macOS application. It uses A
 - Try opening Fantastical manually first
 - Check that URL schemes are enabled in Fantastical preferences
 
-## Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
 ## License
 
 MIT - see [LICENSE](LICENSE) for details.
