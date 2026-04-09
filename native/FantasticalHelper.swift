@@ -7,6 +7,16 @@ let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : "today"
 let param = args.count > 2 ? args[2] : "7"
 
+let excludedCalendars: Set<String> = {
+    guard let env = ProcessInfo.processInfo.environment["EXCLUDED_CALENDARS"] else { return [] }
+    return Set(env.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+}()
+
+func allowedCalendars() -> [EKCalendar]? {
+    if excludedCalendars.isEmpty { return nil }
+    return store.calendars(for: .event).filter { !excludedCalendars.contains($0.title) }
+}
+
 func toISO(_ date: Date) -> String {
     let formatter = ISO8601DateFormatter()
     return formatter.string(from: date)
@@ -39,7 +49,7 @@ store.requestFullAccessToEvents { granted, error in
             sema.signal()
             return
         }
-        let pred = store.predicateForEvents(withStart: start, end: end, calendars: nil)
+        let pred = store.predicateForEvents(withStart: start, end: end, calendars: allowedCalendars())
         let events = store.events(matching: pred).sorted { $0.startDate < $1.startDate }
 
         var result: [[String: String]] = []
@@ -71,7 +81,7 @@ store.requestFullAccessToEvents { granted, error in
             sema.signal()
             return
         }
-        let pred = store.predicateForEvents(withStart: start, end: end, calendars: nil)
+        let pred = store.predicateForEvents(withStart: start, end: end, calendars: allowedCalendars())
         let events = store.events(matching: pred).sorted { $0.startDate < $1.startDate }
 
         var result: [[String: String]] = []
@@ -100,7 +110,7 @@ store.requestFullAccessToEvents { granted, error in
         }
 
     case "calendars":
-        let cals = store.calendars(for: .event)
+        let cals = store.calendars(for: .event).filter { !excludedCalendars.contains($0.title) }
         let result = cals.map { ["name": $0.title, "id": $0.calendarIdentifier] }
         let output: [String: Any] = ["count": cals.count, "calendars": result]
         if let data = try? JSONSerialization.data(withJSONObject: output),

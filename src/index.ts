@@ -30,10 +30,21 @@ const __dirname = dirname(__filename);
 
 const NATIVE_HELPER_PATH = join(__dirname, "native", "fantastical-helper");
 
+const EXCLUDED_CALENDARS: Set<string> = new Set(
+  (process.env.EXCLUDED_CALENDARS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+function isCalendarExcluded(name: string): boolean {
+  return EXCLUDED_CALENDARS.has(name);
+}
+
 async function runNativeHelper(command: string, arg?: string): Promise<string | null> {
   try {
     const cmd = arg ? `${NATIVE_HELPER_PATH} ${command} ${arg}` : `${NATIVE_HELPER_PATH} ${command}`;
-    const { stdout } = await execAsync(cmd, { timeout: 10000 });
+    const { stdout } = await execAsync(cmd, { timeout: 10000, env: { ...process.env } });
     return stdout.trim();
   } catch {
     return null;
@@ -283,6 +294,7 @@ return output`;
             const [calendar, title, start, end, location] = line.split("|");
             return { calendar, title, start, end, location: location || "" };
           })
+          .filter(evt => !isCalendarExcluded(evt.calendar))
           .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
 
         return {
@@ -348,6 +360,7 @@ return output`;
             const [calendar, title, start, end, location] = line.split("|");
             return { calendar, title, start, end, location: location || "" };
           })
+          .filter(evt => !isCalendarExcluded(evt.calendar))
           .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
 
         return {
@@ -412,6 +425,7 @@ return output`;
         const calendars = result
           .split("\n")
           .filter(line => line.trim())
+          .filter(name => !isCalendarExcluded(name))
           .map(name => ({ name }));
 
         return {
