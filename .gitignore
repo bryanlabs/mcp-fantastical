@@ -6,3 +6,4 @@ dist/
 # Claude Code local files
 .claude/memory/
 .claude/settings.local.json
+*.audit-bak

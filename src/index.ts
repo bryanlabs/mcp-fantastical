@@ -18,17 +18,13 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { promisify } from "util";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
 
 const execAsync = promisify(exec);
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const NATIVE_HELPER_PATH = join(__dirname, "native", "fantastical-helper");
+const FLEXIBITS_MCP_PATH = process.env.FLEXIBITS_MCP_PATH ||
+  "/Users/danb/Library/Application Support/Claude/Claude Extensions/ant.dir.gh.flexibits.fantastical-mcp/server/FantasticalMCP.app/Contents/MacOS/FantasticalMCP";
 
 const EXCLUDED_CALENDARS: Set<string> = new Set(
   (process.env.EXCLUDED_CALENDARS || "")
@@ -41,14 +37,166 @@ function isCalendarExcluded(name: string): boolean {
   return EXCLUDED_CALENDARS.has(name);
 }
 
-async function runNativeHelper(command: string, arg?: string): Promise<string | null> {
-  try {
-    const cmd = arg ? `${NATIVE_HELPER_PATH} ${command} ${arg}` : `${NATIVE_HELPER_PATH} ${command}`;
-    const { stdout } = await execAsync(cmd, { timeout: 10000, env: { ...process.env } });
-    return stdout.trim();
-  } catch {
-    return null;
-  }
+type FlexibitsContent = { type: string; text?: string };
+type FlexibitsResult = { content?: FlexibitsContent[]; isError?: boolean };
+
+function localDateString(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+async function callFlexibitsTool(name: string, args: Record<string, unknown> = {}): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(FLEXIBITS_MCP_PATH, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+
+    let buffer = "";
+    let stderr = "";
+    let nextId = 1;
+    let toolCallId = 0;
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error(`Flexibits Fantastical MCP timed out calling ${name}`));
+    }, 10000);
+
+    const send = (message: Record<string, unknown>) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    };
+
+    const finish = (callback: () => void) => {
+      clearTimeout(timeout);
+      child.kill();
+      callback();
+    };
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (error) => {
+      finish(() => reject(error));
+    });
+
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString();
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+        if (!line) {
+          continue;
+        }
+
+        let message: any;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        if (message.id === 1) {
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
+          toolCallId = ++nextId;
+          send({
+            jsonrpc: "2.0",
+            id: toolCallId,
+            method: "tools/call",
+            params: { name, arguments: args },
+          });
+          continue;
+        }
+
+        if (message.id === toolCallId) {
+          if (message.error) {
+            finish(() => reject(new Error(message.error.message || JSON.stringify(message.error))));
+            return;
+          }
+
+          const result = message.result as FlexibitsResult;
+          if (result?.isError) {
+            const text = result.content?.map((item) => item.text).filter(Boolean).join("\n");
+            finish(() => reject(new Error(text || `Flexibits Fantastical MCP returned an error for ${name}`)));
+            return;
+          }
+
+          const text = result?.content?.find((item) => item.type === "text")?.text;
+          if (!text) {
+            finish(() => resolve(result));
+            return;
+          }
+
+          try {
+            finish(() => resolve(JSON.parse(text)));
+          } catch {
+            finish(() => resolve(text));
+          }
+        }
+      }
+    });
+
+    child.on("close", (code) => {
+      if (toolCallId === 0 && code !== null && code !== 0) {
+        finish(() => reject(new Error(stderr || `Flexibits Fantastical MCP exited with code ${code}`)));
+      }
+    });
+
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "mcp-fantastical-bridge", version: "1.0.0" },
+      },
+    });
+  });
+}
+
+async function getFlexibitsCalendarMap(): Promise<Map<string, string>> {
+  const calendars = await callFlexibitsTool("queryCalendars");
+  const rows = Array.isArray(calendars) ? calendars : [];
+  return new Map(
+    rows
+      .filter((calendar: any) => calendar?.id && calendar?.title)
+      .map((calendar: any) => [calendar.id, calendar.title])
+  );
+}
+
+async function getFlexibitsEvents(when: string, query = "") {
+  const [calendarMap, rawEvents] = await Promise.all([
+    getFlexibitsCalendarMap(),
+    callFlexibitsTool("queryCalendarItems", query ? { query, when } : { when }),
+  ]);
+
+  const items = Array.isArray((rawEvents as any)?.items) ? (rawEvents as any).items : [];
+  return items
+    .map((item: any) => {
+      const calendar = calendarMap.get(item.calendarId) || item.calendarId || "";
+      return {
+        calendar,
+        title: item.title || "",
+        start: item.startDate || "",
+        end: item.endDate || "",
+        location: item.location || "",
+      };
+    })
+    .filter((item: { calendar: string }) => !isCalendarExcluded(item.calendar))
+    .sort((a: { start: string }, b: { start: string }) => a.start.localeCompare(b.start));
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function openUrl(url: string): Promise<void> {
+  await execAsync(`/usr/bin/open ${shellQuote(url)}`);
 }
 
 // Helper to run AppleScript
@@ -231,9 +379,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const url = `x-fantastical3://parse?${params.toString()}`;
-        const script = `do shell script "open '${url}'"`;
-
-        await runAppleScript(script);
+        await openUrl(url);
 
         return {
           content: [{
@@ -249,59 +395,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "fantastical_get_today": {
-        // Try native EventKit helper first (faster, no AppleScript permission issues)
-        const nativeResult = await runNativeHelper("today");
-        if (nativeResult) {
-          return {
-            content: [{
-              type: "text",
-              text: nativeResult,
-            }],
-          };
-        }
-
-        // Fallback to AppleScript
-        const script = `
-set output to ""
-set todayStart to current date
-set hours of todayStart to 0
-set minutes of todayStart to 0
-set seconds of todayStart to 0
-set todayEnd to todayStart + (1 * days)
-
-tell application "Calendar"
-  repeat with cal in calendars
-    set calName to name of cal
-    try
-      set calEvents to (every event of cal whose start date >= todayStart and start date < todayEnd)
-      repeat with evt in calEvents
-        set evtTitle to summary of evt
-        set evtStart to start date of evt
-        set evtEnd to end date of evt
-        set evtLoc to location of evt
-        set output to output & calName & "|" & evtTitle & "|" & (evtStart as string) & "|" & (evtEnd as string) & "|" & evtLoc & "\\n"
-      end repeat
-    end try
-  end repeat
-end tell
-return output`;
-
-        const result = await runAppleScriptMultiline(script);
-        const events = result
-          .split("\n")
-          .filter(line => line.trim())
-          .map(line => {
-            const [calendar, title, start, end, location] = line.split("|");
-            return { calendar, title, start, end, location: location || "" };
-          })
-          .filter(evt => !isCalendarExcluded(evt.calendar))
-          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+        const today = localDateString(new Date());
+        const events = await getFlexibitsEvents(today);
 
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              date: new Date().toISOString().split("T")[0],
+              date: today,
               count: events.length,
               events,
             }, null, 2),
@@ -311,65 +412,19 @@ return output`;
 
       case "fantastical_get_upcoming": {
         const { days = 7 } = args as { days?: number };
-
-        // Try native EventKit helper first (faster, no AppleScript permission issues)
-        const nativeUpcoming = await runNativeHelper("upcoming", String(days));
-        if (nativeUpcoming) {
-          return {
-            content: [{
-              type: "text",
-              text: nativeUpcoming,
-            }],
-          };
-        }
-
-        // Fallback to AppleScript
         const today = new Date();
         const endDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + days);
-
-        const script = `
-set output to ""
-set rangeStart to current date
-set hours of rangeStart to 0
-set minutes of rangeStart to 0
-set seconds of rangeStart to 0
-set rangeEnd to rangeStart + (${days} * days)
-
-tell application "Calendar"
-  repeat with cal in calendars
-    set calName to name of cal
-    try
-      set calEvents to (every event of cal whose start date >= rangeStart and start date < rangeEnd)
-      repeat with evt in calEvents
-        set evtTitle to summary of evt
-        set evtStart to start date of evt
-        set evtEnd to end date of evt
-        set evtLoc to location of evt
-        set output to output & calName & "|" & evtTitle & "|" & (evtStart as string) & "|" & (evtEnd as string) & "|" & evtLoc & "\\n"
-      end repeat
-    end try
-  end repeat
-end tell
-return output`;
-
-        const result = await runAppleScriptMultiline(script);
-        const events = result
-          .split("\n")
-          .filter(line => line.trim())
-          .map(line => {
-            const [calendar, title, start, end, location] = line.split("|");
-            return { calendar, title, start, end, location: location || "" };
-          })
-          .filter(evt => !isCalendarExcluded(evt.calendar))
-          .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+        const start = localDateString(today);
+        const end = localDateString(endDate);
+        const events = await getFlexibitsEvents(`from ${start} to ${end}`);
 
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
               range: {
-                start: today.toISOString().split("T")[0],
-                end: endDate.toISOString().split("T")[0],
+                start,
+                end,
                 days,
               },
               count: events.length,
@@ -382,9 +437,7 @@ return output`;
       case "fantastical_show_date": {
         const { date } = args as { date: string };
 
-        // Use URL scheme to show date in Fantastical
-        const script = `do shell script "open 'x-fantastical3://show/calendar/${encodeURIComponent(date)}'"`;
-        await runAppleScript(script);
+        await openUrl(`x-fantastical3://show/calendar/${encodeURIComponent(date)}`);
 
         return {
           content: [{
@@ -398,35 +451,17 @@ return output`;
       }
 
       case "fantastical_get_calendars": {
-        // Try native EventKit helper first (faster, no AppleScript permission issues)
-        const nativeCalendars = await runNativeHelper("calendars");
-        if (nativeCalendars) {
-          return {
-            content: [{
-              type: "text",
-              text: nativeCalendars,
-            }],
-          };
-        }
-
-        // Fallback to AppleScript
-        const script = `
-set output to ""
-tell application "Calendar"
-  repeat with cal in calendars
-    set calName to name of cal
-    set calColor to color of cal
-    set output to output & calName & "\\n"
-  end repeat
-end tell
-return output`;
-
-        const result = await runAppleScriptMultiline(script);
-        const calendars = result
-          .split("\n")
-          .filter(line => line.trim())
-          .filter(name => !isCalendarExcluded(name))
-          .map(name => ({ name }));
+        const result = await callFlexibitsTool("queryCalendars");
+        const calendars = (Array.isArray(result) ? result : [])
+          .filter((calendar: any) => calendar?.title && !isCalendarExcluded(calendar.title))
+          .map((calendar: any) => ({
+            name: calendar.title,
+            id: calendar.id,
+            sourceName: calendar.sourceName,
+            isWritable: calendar.isWritable,
+            supportsEvents: calendar.supportsEvents,
+            supportsTasks: calendar.supportsTasks,
+          }));
 
         return {
           content: [{
@@ -441,17 +476,15 @@ return output`;
 
       case "fantastical_search": {
         const { query } = args as { query: string };
-
-        // Search using URL scheme which opens Fantastical's search
-        const script = `do shell script "open 'x-fantastical3://search?query=${encodeURIComponent(query)}'"`;
-        await runAppleScript(script);
+        const events = await getFlexibitsEvents("today through 1 year from today", query);
 
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              success: true,
-              message: `Opened Fantastical search for: "${query}"`,
+              query,
+              count: events.length,
+              events,
             }, null, 2),
           }],
         };
