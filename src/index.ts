@@ -39,6 +39,17 @@ function isCalendarExcluded(name: string): boolean {
 
 type FlexibitsContent = { type: string; text?: string };
 type FlexibitsResult = { content?: FlexibitsContent[]; isError?: boolean };
+type FlexibitsCalendar = {
+  id?: string;
+  title?: string;
+  sourceName?: string;
+  isWritable?: boolean;
+  supportsEvents?: boolean;
+};
+type WritableEventCalendar = FlexibitsCalendar & {
+  id: string;
+  title: string;
+};
 
 function localDateString(date: Date): string {
   const year = date.getFullYear();
@@ -169,6 +180,73 @@ async function getFlexibitsCalendarMap(): Promise<Map<string, string>> {
   );
 }
 
+function formatCalendarDisplay(row: WritableEventCalendar): string {
+  return row.sourceName ? `${row.title} (${row.sourceName})` : row.title;
+}
+
+function formatCalendarQualifiedName(row: WritableEventCalendar): string {
+  return row.sourceName ? `${row.sourceName}/${row.title}` : row.title;
+}
+
+function formatCalendarOption(row: WritableEventCalendar): string {
+  return `${formatCalendarQualifiedName(row)} [${row.id}]`;
+}
+
+async function resolveFlexibitsCalendar(calendar?: string): Promise<{
+  calendarId?: string;
+  displayName: string;
+}> {
+  if (!calendar) {
+    return { displayName: "default" };
+  }
+
+  const result = await callFlexibitsTool("queryCalendars");
+  const calendars: WritableEventCalendar[] = (Array.isArray(result) ? result : [])
+    .filter((row: FlexibitsCalendar): row is WritableEventCalendar =>
+      typeof row?.id === "string" &&
+      typeof row?.title === "string" &&
+      row.isWritable !== false &&
+      row.supportsEvents !== false &&
+      !isCalendarExcluded(row.title)
+    );
+
+  const idMatch = calendars.find((row) => row.id === calendar);
+  if (idMatch) {
+    return {
+      calendarId: idMatch.id,
+      displayName: formatCalendarDisplay(idMatch),
+    };
+  }
+
+  const exactMatches = calendars.filter((row) => row.title === calendar);
+  const caseInsensitiveMatches = exactMatches.length > 0
+    ? exactMatches
+    : calendars.filter((row) => row.title.toLowerCase() === calendar.toLowerCase());
+  const sourceQualifiedMatches = caseInsensitiveMatches.length > 0
+    ? caseInsensitiveMatches
+    : calendars.filter((row) => formatCalendarQualifiedName(row).toLowerCase() === calendar.toLowerCase());
+
+  if (sourceQualifiedMatches.length === 1) {
+    const match = sourceQualifiedMatches[0];
+    return {
+      calendarId: match.id,
+      displayName: formatCalendarDisplay(match),
+    };
+  }
+
+  if (sourceQualifiedMatches.length > 1) {
+    const options = sourceQualifiedMatches
+      .map(formatCalendarOption)
+      .join(", ");
+    throw new Error(`Calendar "${calendar}" is ambiguous. Use one of these calendar IDs: ${options}`);
+  }
+
+  const available = calendars
+    .map(formatCalendarOption)
+    .join(", ");
+  throw new Error(`Calendar "${calendar}" was not found or is not writable. Available writable event calendars: ${available}`);
+}
+
 async function getFlexibitsEvents(when: string, query = "") {
   const [calendarMap, rawEvents] = await Promise.all([
     getFlexibitsCalendarMap(),
@@ -197,6 +275,14 @@ function shellQuote(value: string): string {
 
 async function openUrl(url: string): Promise<void> {
   await execAsync(`/usr/bin/open ${shellQuote(url)}`);
+}
+
+function buildFantasticalParseUrl(params: Record<string, string | undefined>): string {
+  const query = Object.entries(params)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join("&");
+  return `x-fantastical3://parse?${query}`;
 }
 
 // Helper to run AppleScript
@@ -365,21 +451,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           addImmediately?: boolean;
         };
 
-        // Build URL with parameters
-        const params = new URLSearchParams();
-        params.append("s", sentence);
-        if (addImmediately) {
-          params.append("add", "1");
-        }
-        if (calendar) {
-          params.append("calendarName", calendar);
-        }
-        if (notes) {
-          params.append("n", notes);
+        const targetCalendar = await resolveFlexibitsCalendar(calendar);
+
+        if (!addImmediately || notes) {
+          const url = buildFantasticalParseUrl({
+            s: sentence,
+            add: addImmediately ? "1" : undefined,
+            calendarName: calendar,
+            n: notes,
+          });
+          await openUrl(url);
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                message: addImmediately
+                  ? `Event creation requested through Fantastical: "${sentence}"`
+                  : `Opened Fantastical event draft: "${sentence}"`,
+                calendar: targetCalendar.displayName,
+                addedImmediately: addImmediately,
+              }, null, 2),
+            }],
+          };
         }
 
-        const url = `x-fantastical3://parse?${params.toString()}`;
-        await openUrl(url);
+        const created = await callFlexibitsTool("createCalendarItem", {
+          description: sentence,
+          type: "event",
+          ...(targetCalendar.calendarId ? { calendarId: targetCalendar.calendarId } : {}),
+        });
 
         return {
           content: [{
@@ -387,8 +489,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify({
               success: true,
               message: `Event created: "${sentence}"`,
-              calendar: calendar || "default",
-              addedImmediately: addImmediately,
+              calendar: targetCalendar.displayName,
+              addedImmediately: true,
+              result: created,
             }, null, 2),
           }],
         };
